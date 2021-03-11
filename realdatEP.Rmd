@@ -1,0 +1,822 @@
+---
+title: "EPC++"
+author: "Olobatuyi Kehinde Ibukun"
+date: "7/17/2019"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+require(keras)
+library(tidyverse)
+#tidyverse_packages()
+library(OpenMPController)
+library(caret)
+library(ggplot2)
+library(SIBER)
+library(factoextra)
+library(FactoMineR)
+library(xtable)
+library(tidyverse)
+cores <- parallel::detectCores()
+#install.packages("viridis")  # Install
+library("viridis")
+library(RColorBrewer)
+#display.brewer.all()
+
+```
+
+
+
+```{Rcpp}
+
+//arma::vec dual_m, arma::vec dual_v,
+// const arma::mat& sigma
+
+#include <typeinfo>
+#include <iostream>
+#include <RcppArmadillo.h>
+#include <omp.h>
+#include <mvnorm.h>
+#include <math.h>
+
+// [[Rcpp::depends(RcppArmadillo, RcppDist)]]
+
+using namespace Rcpp;
+
+// [[Rcpp::export]]
+
+arma::mat rcpp_ep(arma::mat& y1, arma::mat K, arma::mat& mx, double vx, double term_m, 
+             double term_v, double lam, double rho, int a, int b, int maxit, int j, int cores){
+  
+  // Parallel
+  
+  omp_set_num_threads(cores);
+  
+  // Variable declaration
+  
+  int m = K.n_rows;
+  int n = K.n_cols;
+  
+  arma::mat K1(m,n);
+  
+  double cav_m;
+  double cav_v;
+  double my;
+  double vy;
+  
+  NumericVector y(m);
+  
+  y = wrap(y1);
+  
+  NumericVector dual_m(n+1);
+  
+  dual_m(0) = 1;
+  
+  NumericVector dual_v(n + 1);
+  
+  dual_v(0) = 1;
+  
+  K1 = K % K;
+  
+  for(int i = 0; i < m; i++){
+    
+    for(int k = 0; k < n; k++){
+    
+      cav_v = pow((pow(vx, -1) - pow(term_v, -1)),-1);
+    
+      cav_m = mx(i,k) + cav_v * pow(term_v, -1) * (mx(i,k) - term_m);
+    
+      my = K(i,k) * cav_m; 
+      
+      vy = K1(i,k) * cav_v + lam;
+  
+      // ADMM algorithm ((y.row(i) - my) / vy)
+    
+      mx(i,k) = cav_m + cav_v * K(i,k) * ((y(i) - my) / vy) + dual_m(i) + (rho * (cav_m - a));
+    
+      dual_m(i+1) = dual_m(i) + (rho * (cav_m - a));
+    
+      vx = (cav_v * lam / vy) + dual_v(i) + (rho * (cav_v - b));
+
+      dual_v(i+1) = dual_v(i) + rho * (cav_v - b);
+        
+      // Appro dist
+  
+      term_v = pow((pow(vx,-1) - pow(cav_v, -1)), -1);
+      term_m = cav_m + ((term_v + cav_v) * pow(cav_v, -1) * (mx(i,k) - cav_m));
+      rho = pow(((i + 1)*j*(k + 1) + (maxit*n*m)), -1);
+      
+    }
+  
+  }
+  
+  //List res;
+
+  //res["mx"]  = mx;
+  //res["vx"]  = vx;
+  //res["term_m"] = term_m;
+  //res["term_v"] = term_v;
+  //res["cav_m"] = cav_m;
+  //res["cav_v"] = cav_v;
+  //res["rho"] = rho;
+  //res["dual_m"] = dual_m;
+  //res["dual_v"] = dual_v;
+  //res["my"] = my;
+  //res["vy"] = vy;
+  return mx;
+  
+}
+
+
+```
+
+
+```{r}
+
+# To tidy codes
+
+setwd("D:\\Milan\\PhD Research\\UK Visiting research\\VISITING")
+#setwd("C:\\Users\\Che\\Desktop\\Milan\\PhD Research\\UK Visiting research\\VISITING")
+getwd()
+
+
+```
+
+```{r}
+
+real <- read.table("5h static_mibi.txt", header = TRUE)
+realD <- tbl_df(real)
+realD <- as.matrix(realD)
+head(realD)
+
+real1 <- read.table("252_mdp_mouse1_static_1h_4pi.txt", header = TRUE)
+realD1 <- tbl_df(real1)
+realD1 <- as.matrix(realD1)
+head(realD1)
+
+real2 <- read.table("24h_pi_DMSA.txt", header = TRUE)
+realD2 <- tbl_df(real2)
+realD2 <- as.matrix(realD2)
+head(realD2)
+
+par(mfrow = c(1,3), mar = c(2,2,2,2))
+
+image(realD1, main="252_mdp_mouse1", col.main = "red", xlab="", 
+      ylab="",col = grey(32:0/32),axes=F); box()
+legend("topright", "(a)", bg = "white", adj = 1, text.width = 0)
+image(realD2, main="24h_pi_DMSA", col.main = "red", xlab="", 
+      ylab="",col = grey(32:0/32),axes=F); box()
+legend("topright", "(b)", bg = "white", adj = 1, text.width = 0)
+image(realD, main="5h static_mibi", col.main = "red", xlab="", 
+      ylab="",col = grey(32:0/32),axes=F); box()
+legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+
+
+act <- read.table("4_activities.txt")
+real_act <- tbl_df(act)
+real_act <- as.matrix(real_act)
+image(real_act, main="4_activities", col.main = "red", xlab="", 
+      ylab="",col = grey(32:0/32),axes=F); box()
+
+dim(real_act)
+
+#view(real_act)
+
+real_cyl <- read.table("4_cylinders.txt")
+real_cyl <- tbl_df(real_cyl)
+real_cyl <- as.matrix(real_cyl)
+image(real_cyl, main="4_cylinders", col.main = "red", xlab="", 
+      ylab="",col = grey(32:0/32),axes=F); box()
+
+dim(real_cyl)
+
+
+
+```
+
+
+#Used for write-up
+
+```{r real_rcpp}
+
+#sim_Code_for_SSEP
+
+p.tau <- function(x, tau, a_ti){
+  
+  llik <- sum(dnorm(x, 0, tau, log = TRUE))
+  le   <- sum(dexp(tau, a_ti, log = TRUE))
+  return(llik + le)
+  
+}
+
+p.lam <- function(y, mu, lam, a_li){
+  
+  llik <- sum(dnorm(y, mu, lam, log = TRUE))
+  le   <- sum(dexp(lam, a_li, log = TRUE))
+  return(llik + le)
+  
+}
+
+
+######################### SSEP for Simulated data
+
+EP <- function(y, K, maxit = 50, show_progress_bar = FALSE, plot = FALSE)
+  
+{
+  
+  cat("Starting...\n")
+  
+  start.time = Sys.time()
+  
+  
+  #graphics.off()
+  library(mise)
+  
+  mise(vars = FALSE, figs = TRUE, pkgs = FALSE, console = TRUE)
+  
+  refresh <- 10
+  # Initialize
+  
+  m = nrow(y);n <- ncol(y)
+  XB <- XA <- array(NA, c(m, n, maxit))
+  XT1 <- XL1 <- matrix(NA, nrow = nrow(y), ncol = maxit)
+  mu <- matrix(K %*% as.vector(y), m, n)
+  # Start the progress bar
+  pb3 <- txtProgressBar(min = 1, max = maxit, style = 3)
+  
+  mx <- matrix(0, nrow = nrow(K), ncol = ncol(K))
+  Q <- matrix(0, nrow = nrow(K), ncol = maxit)
+
+  vx <- 0.01; tit_vi <- Inf
+
+  # App lik
+
+  lam2 <- 0.01; tit_mi <- 0; rho <- 1; b <- a <- 1
+
+  a0 <- al.new <- at.new <- 10
+  
+  a_t <- a_l <- 2; a_v <- 1; #mu.new <- mu
+
+  lam1 <- matrix(0.001, nrow = m, ncol = n)
+  tau1 <- NULL 
+  a_li <- a_ti <- 1
+  #tau.new1 <- tau; lam.new1 <- lam
+  tau <- 100
+  lam <- 0.001
+  
+  for(j in 1:maxit){
+    
+    # X update from rcpp
+
+    mx1 <- rcpp_ep(y1 = y, K = K, mx, vx, term_m = tit_mi, term_v = tit_vi, lam = lam2, 
+            rho, a, b, maxit, j, cores)
+    
+    Q <- colSums(mx1)
+    
+    m2 <- matrix(Q, nrow = m, ncol = n)
+    
+    #########################
+    #     Tau
+    ######################### 
+    
+    a_ti <- at.new - a_t
+    
+    tau.new <- tau * rnorm(1)
+    
+    if(tau.new > 0){
+      
+      lpost.difft <- p.tau(x = m2, tau = tau.new, a_ti) - p.tau(x = m2, tau = tau, a_ti)
+        
+      acet <- min(lpost.difft, 1)
+        
+      if (acet > log(runif(1))){
+          
+        tau <- tau.new
+         
+        tau1[j] <- tau
+          
+      }else{
+        
+        tau <- tau
+        tau1[j] <- tau
+        
+     }
+      
+    }else{
+        
+      tau <- tau
+      tau1[j] <- tau
+    }
+    
+    #at.new <- mean(tau1) #* var(as.vector(tau1))
+    
+    #a_t <- at.new - a_ti;
+    
+    # mu <- matrix(K %*% as.vector(m2), m, n)
+
+    ##################
+    # Lambda
+    ##################
+    
+    # Old Posterior
+    a_li <- al.new - a_l
+    
+    for (i in 1:m) {
+      
+      for (k in 1:n) {
+        
+        lam.new <- mu[i,k] + lam * rnorm(1)
+    
+        if(lam.new > 0){
+      
+         lpost.diffl <- p.lam(y, mu, lam = lam.new, a_li) - 
+         p.lam(y, mu, lam = lam, a_li)
+          
+         ace <- min(lpost.diffl, 1)
+        
+         if (ace > log(runif(1))){
+          
+          lam <- lam.new
+         
+          lam1[i,k] <- lam
+        
+          #al.new <- mean(lam1) #* var(as.vector(lam))
+     
+          #a_l <- al.new - a_li;
+
+          #lam2 <- al.new^-1
+          
+       }else{
+         
+        lam <- lam
+        lam1[i,k] <- lam
+      }
+      
+     }else{
+        
+       lam <- lam
+       lam1[i,k] <- lam
+     }
+        
+    }
+      
+   }
+    
+    # XB[,,j] <- pos
+    #XT1[,j] <- apply(tau1, 1, mean); 
+    XL1[,j] <- apply(lam1, 1, mean)
+    
+    # Progress bar
+    if(show_progress_bar) setTxtProgressBar(pb3, j)
+    
+    if(plot){
+      
+      if(j == refresh*round(j/refresh)){
+        
+        #pdf(paste(j, ".pdf", sep = ""))
+        
+        par(mfrow=c(1,3), mar=c(5, 3, 3, 3), mgp=c(1.7,.65, 0))
+        #par(mfrow=c(2,2),mar=c(1, 3, 1, 1), mgp=c(1.8, 0.7, 0))
+        
+        #mise(vars = FALSE, figs = TRUE, pkgs = FALSE, console = TRUE)
+        
+        #cat("...\n","Iteration:",j,"...\n")
+        
+        image(y, main = "Data, y", xlab="", ylab="",col=grey(32:0/32),axes=F); box()
+        image(m2, main = paste("Iteration:",j), xlab="",ylab="",col=grey(32:0/32),axes=F);box()
+        image(mu, main = paste("mu Iteration:",j), xlab="",ylab="",col=grey(32:0/32),axes=F);box()
+        #dev.off()
+        
+      }
+    }
+  }  
+  
+  #variance1 <- apply(XT1, 2, mean)
+  sigma <- apply(XL1, 2, mean)
+
+  
+  par(mfrow=c(1,2), mar=c(5, 1.5, 5, 1.5), mgp=c(1.7,.65, 0))
+  
+  image(m2, main= "X", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+  image(y-m2, main= "residual", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+  # plot(L1, tauM, type = "p", ylab = expression(tau), xlab = "", cex = .5, main = expression(tau)) 
+  # plot(L2, Sig, type = "p", ylab = expression(sigma), xlab = "", cex = .5, main = expression(sigma))
+  
+  end.time = Sys.time()
+  cat("...\n", "Elapsed time: ", end.time - start.time)
+  
+  #dev.off()
+  
+  return(list("x" = m2, "tau" = tau1, "sigma" = sigma^-1))
+  
+}
+
+
+```
+
+
+
+```{r RealD}
+
+############################################################ RGA June 2019
+
+# Start of R-code fragment ################################# From 'Make_Data - v3.3.R'
+# ................................
+#setwd("D:\\Milan\\PhD Research\\UK Visiting research\\VISITING")
+
+source("functions K+L.R")
+
+mc = nrow(realD)
+mr = ncol(realD)
+nc = nrow(realD)
+nr = ncol(realD)
+
+# mc = 150; mr = 4 nc = 150; nr = 4
+
+ddelta = 0.58
+sigma = 0.1
+# ddelta = 5.8; sigma = 1
+
+# The function call to getK takes about >2 mins ............
+K = getKG(nc, nr, mc, mr, delta = ddelta)
+
+#f$x
+
+y <- realD2
+
+maxit = 1000
+
+fes <- replicate(10, EP(y, K, maxit = maxit, show_progress_bar = TRUE, plot = TRUE))
+
+par(mfrow=c(2,2), mar=c(1, 1.5, 1, 1.5), mgp=c(1.7,.65, 0))
+
+image(fes[,1]$x, main= "", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(a)", bg = "white", adj = 1, text.width = 0)
+image(y-fes[,1]$x, main= "residual", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(b)", bg = "white", adj = 1, text.width = 0)
+traceplot(me)
+legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+traceplot(s)
+legend("topright", "(d)", bg = "white", adj = 1, text.width = 0)
+
+
+```
+
+
+```{r}
+
+library(coda)
+#fes <- mo
+m1 <- mcmc(fes[,1]$tau)
+m2 <- mcmc(fes[,2]$tau)
+m3 <- mcmc(fes[,3]$tau)
+m4 <- mcmc(fes[,4]$tau)
+m5 <- mcmc(fes[,5]$tau)
+m6 <- mcmc(fes[,6]$tau)
+m7 <- mcmc(fes[,7]$tau)
+m8 <- mcmc(fes[,8]$tau)
+m9 <- mcmc(fes[,9]$tau)
+m10 <- mcmc(fes[,10]$tau)
+
+
+#write.table(fes, "SSEP.10_mouse.dat")
+
+me <- mcmc.list(m1, m2, m3, m4, m5, m6, m7, m8, m9, m10)
+
+acfplot(me, outer = T)
+gelman.diag(me)
+gelman.plot(me)
+densityplot(me)
+
+
+
+s1 <- mcmc(fes[,1]$sigma)
+s2 <- mcmc(fes[,2]$sigma)
+s3 <- mcmc(fes[,3]$sigma)
+s4 <- mcmc(fes[,4]$sigma)
+s5 <- mcmc(fes[,5]$sigma)
+s6 <- mcmc(fes[,6]$sigma)
+s7 <- mcmc(fes[,7]$sigma)
+s8 <- mcmc(fes[,8]$sigma)
+s9 <- mcmc(fes[,9]$sigma)
+s10 <- mcmc(fes[,10]$sigma)
+
+s <- mcmc.list(s1, s2, s3, s4, s5, s6, s7, s8, s9, s10)
+
+#write.table(fes, "SSEP_sigma.dat")
+#write.table(as.matrix(me), "SSEP_tau1_chain.dat")
+
+
+acfplot(s, outer = T)
+gelman.diag(s)
+gelman.plot(s)
+densityplot(s)
+
+RE <- matrix(NA, nrow = 1000, ncol = 10)
+
+for (i in 1:10) {
+  
+  RE[,i] <- fes[,i]$tau
+  
+}
+
+#write.csv(RE, "cyl_tau_ssep.csv")
+mean(colMeans(RE))
+
+dim(RE)
+
+W <- mean(apply(RE, 2, var))
+
+B <- var(apply(RE, 2, mean))
+
+sig <- ((1000 - 1) / 1000 * W) + (B)
+V <- sig + (B / 10000)
+V/W
+
+#sde <- read.csv("Mibi_sigma_ssep.csv")
+
+sig <- (1000 - 1) / 1000 * W + B/1000
+V <- sig + B / 10000
+V/sig
+plot(me)
+
+
+We <- apply(RE1, 1, var)
+sige <- ((1000 - 1) / 1000 * We) + (B/1000)
+V <- sige + (B / 10000)
+
+
+{plot(sqrt(V), type = "l", col = "red", ylab = "Variance estimates", xlab = "Iteration no")
+#par(new = TRUE)
+lines(sqrt(We), lwd = 2, lty = 2)}
+
+
+plot(V/We, type = "l")
+
+```
+
+
+
+
+```{r real_act}
+
+############################################################ RGA June 2019
+
+# Start of R-code fragment ################################# From 'Make_Data - v3.3.R'
+# ................................
+#setwd("D:\\Milan\\PhD Research\\UK Visiting research\\VISITING")
+
+source("functions K+L.R")
+
+mc = nrow(real_act)
+mr = ncol(real_act)
+nc = nrow(real_act)
+nr = ncol(real_act)
+
+# mc = 150; mr = 4 nc = 150; nr = 4
+
+ddelta = 0.58
+sigma = 0.1
+# ddelta = 5.8; sigma = 1
+
+# The function call to getK takes about >2 mins ............
+K = getKG(nc, nr, mc, mr, delta = ddelta)
+
+acf(f$sigma)
+y <- real_act
+
+maxit = 1000
+
+f <- EP(y, K, maxit = maxit, show_progress_bar = TRUE, plot = TRUE)
+
+```
+
+
+
+
+```{r real_cyl}
+
+############################################################ RGA June 2019
+
+# Start of R-code fragment ################################# From 'Make_Data - v3.3.R'
+# ................................
+#setwd("D:\\Milan\\PhD Research\\UK Visiting research\\VISITING")
+
+source("functions K+L.R")
+
+mc = nrow(real_cyl)
+mr = ncol(real_cyl)
+nc = nrow(real_cyl)
+nr = ncol(real_cyl)
+
+# mc = 150; mr = 4 nc = 150; nr = 4
+
+ddelta = 0.58
+sigma = 0.1
+# ddelta = 5.8; sigma = 1
+
+# The function call to getK takes about >2 mins ............
+K = getKG(nc, nr, mc, mr, delta = ddelta)
+
+
+y <- real_cyl
+
+maxit = 1000
+
+# Calculate mu .............................................
+mu = matrix(K %*% as.vector(y), nc, nr)
+
+f <- EP(y, K, maxit = maxit, show_progress_bar = TRUE, plot = TRUE)
+
+par(mfrow=c(2,2), mar=c(1, 1.5, 1, 1.5), mgp=c(1.7,.65, 0))
+
+
+image(f$x, main= "", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(a)", bg = "white", adj = 1, text.width = 0)
+image(y-f$x, main= "residual", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(b)", bg = "white", adj = 1, text.width = 0)
+
+plot(f$tau, type = "p", ylab = expression(tau), xlab = "", cex = .5, main = expression(tau))
+legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+# plot(f4$sigma**-1, type = "l", ylab = expression(sigma), xlab = "", cex = .5, main = expression(sigma))
+# legend("bottomright", "(b)", bg = "white", adj = 1, text.width = 0)
+
+# tauM <- cumsum(f$tau) / 1:length(f$tau)
+# esterr <- sqrt(cumsum((f$tau - tauM)^2)) / 1:length(f$tau)
+# U <- tauM + 2 * esterr; L <- tauM - 2 * esterr
+# L1 <- 1:length(f$tau)
+
+Sig <- cumsum(f$sigma^-1) / 1:length(f4$sigma)
+# estes <- sqrt(cumsum((fes$sigma - Sig)^2)) / 1:length(f4$sigma)
+# U <- Sig + 2 * estes; L <- Sig - 2 * estes
+# L2 <- 1:length(f4$sigma)
+
+plot(Sig, xlab = "", main = expression(sigma))
+legend("topright", "(d)", bg = "white", adj = 1, text.width = 0)
+acf(f$tau, main="")
+legend("topright", "(d)", bg = "white", adj = 1, text.width = 0)
+
+mean(f$tau); mean(f$sigma)
+#legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+Mibi_data <- data.frame(f$tau, Sig)
+
+#write.csv(Mibi_data, "cyl.csv")
+
+hist(f3$sigma)
+lines(density(f3$sigma))
+
+```
+
+
+
+```{r RealD1}
+
+############################################################ RGA June 2019
+
+# Start of R-code fragment ################################# From 'Make_Data - v3.3.R'
+# ................................
+#setwd("D:\\Milan\\PhD Research\\UK Visiting research\\VISITING")
+
+source("functions K+L.R")
+
+mc = nrow(realD1)
+mr = ncol(realD1)
+nc = nrow(realD1)
+nr = ncol(realD1)
+
+# mc = 150; mr = 4 nc = 150; nr = 4
+
+ddelta = 0.58
+sigma = 0.1
+# ddelta = 5.8; sigma = 1
+
+# The function call to getK takes about >2 mins ............
+K = getKG(nc, nr, mc, mr, delta = ddelta)
+
+
+y <- realD1
+
+maxit = 1000
+
+fD1 <- EP2(y, K, maxit = maxit, show_progress_bar = TRUE, plot = TRUE)
+
+par(mfrow=c(2,2), mar=c(1, 1.5, 1, 1.5), mgp=c(1.7,.65, 0))
+
+
+image(fD1$x, main= "", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(a)", bg = "white", adj = 1, text.width = 0)
+image(y-fD1$x, main= "residual", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(b)", bg = "white", adj = 1, text.width = 0)
+
+plot(fD1$tau, type = "p", ylab = expression(tau), xlab = "", cex = .5, main = expression(tau))
+legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+# plot(f4$sigma**-1, type = "l", ylab = expression(sigma), xlab = "", cex = .5, main = expression(sigma))
+# legend("bottomright", "(b)", bg = "white", adj = 1, text.width = 0)
+
+# tauM <- cumsum(f$tau) / 1:length(f$tau)
+# esterr <- sqrt(cumsum((f$tau - tauM)^2)) / 1:length(f$tau)
+# U <- tauM + 2 * esterr; L <- tauM - 2 * esterr
+# L1 <- 1:length(f$tau)
+
+Sig <- cumsum(fD1$sigma^-1) / 1:length(f4$sigma)
+estes <- sqrt(cumsum((fD1$sigma^-1 - Sig)^2)) / 1:length(f4$sigma)
+U <- Sig + 2 * estes; L <- Sig - 2 * estes
+L2 <- 1:length(f4$sigma)
+
+plot(Sig, xlab = "", main = expression(sigma))
+legend("topright", "(d)", bg = "white", adj = 1, text.width = 0)
+acf(fD1$sigma, main="")
+legend("topright", "(d)", bg = "white", adj = 1, text.width = 0)
+
+fD1$tau[1000]; fD1$sigma[1000]^-1
+#legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+Mibi_data <- data.frame(fD1$tau, Sig)
+
+write.csv(Mibi_data, "mouse.csv")
+
+hist(f3$sigma)
+lines(density(f3$sigma))
+
+
+
+```
+
+
+```{r RealD2}
+
+############################################################ RGA June 2019
+
+# Start of R-code fragment ################################# From 'Make_Data - v3.3.R'
+# ................................
+#setwd("D:\\Milan\\PhD Research\\UK Visiting research\\VISITING")
+
+source("functions K+L.R")
+
+mc = nrow(realD2)
+mr = ncol(realD2)
+nc = nrow(realD2)
+nr = ncol(realD2)
+
+# mc = 150; mr = 4 nc = 150; nr = 4
+
+ddelta = 0.58
+sigma = 0.1
+# ddelta = 5.8; sigma = 1
+
+# The function call to getK takes about >2 mins ............
+K = getKG(nc, nr, mc, mr, delta = ddelta)
+
+y <- realD2
+
+maxit = 1000
+
+f <- EP(y, K, maxit = maxit, show_progress_bar = TRUE, plot = TRUE)
+
+par(mfrow=c(2,2), mar=c(1, 1.5, 1, 1.5), mgp=c(1.7,.65, 0))
+
+
+image(f$x, main= "", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(a)", bg = "white", adj = 1, text.width = 0)
+image(y-f$x, main= "", xlab="",ylab="",col=grey(32:0/32),axes=F); box()
+legend("topright", "(b)", bg = "white", adj = 1, text.width = 0)
+
+plot(f$tau, type = "p", ylab = expression(tau), xlab = "", cex = .5, main = expression(tau))
+legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+# plot(f4$sigma**-1, type = "l", ylab = expression(sigma), xlab = "", cex = .5, main = expression(sigma))
+# legend("bottomright", "(b)", bg = "white", adj = 1, text.width = 0)
+
+# tauM <- cumsum(f$tau) / 1:length(f$tau)
+# esterr <- sqrt(cumsum((f$tau - tauM)^2)) / 1:length(f$tau)
+# U <- tauM + 2 * esterr; L <- tauM - 2 * esterr
+# L1 <- 1:length(f$tau)
+
+Sig <- cumsum(f$sigma^-1) / 1:length(f4$sigma)
+estes <- sqrt(cumsum((fty$sigma^-1 - Sig)^2)) / 1:length(f4$sigma)
+U <- Sig + 2 * estes; L <- Sig - 2 * estes
+L2 <- 1:length(f4$sigma)
+
+plot(Sig, xlab = "", main = expression(sigma))
+legend("topright", "(d)", bg = "white", adj = 1, text.width = 0)
+# acf(ft$tau, main="")
+# legend("topright", "(d)", bg = "white", adj = 1, text.width = 0)
+
+f$tau[1000]; f$sigma[1000]^-1
+#legend("topright", "(c)", bg = "white", adj = 1, text.width = 0)
+Mibi_data <- data.frame(f$tau, Sig)
+
+#write.csv(Mibi_data, "DMSA_used_lamfixed.csv")
+
+autocorr.plot(f$sigma)
+gelman.plot(f)
+effectiveSize(f$tau)
+
+hist(f3$sigma)
+lines(density(f3$sigma))
+
+
+```
